@@ -1,0 +1,1 @@
+/home/oliver/projects/math_macroquad/target/release/math_macroquad: /home/oliver/projects/math_macroquad/assets/cmunbsr.ttf /home/oliver/projects/math_macroquad/assets/cmunso.ttf /home/oliver/projects/math_macroquad/src/main.rs

@@ -1,0 +1,7 @@
+set(ANDROID_PLATFORM android-18)
+set(ANDROID_ABI armeabi-v7a)
+string(REPLACE "--target=armv7-linux-androideabi" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+string(REPLACE "--target=armv7-linux-androideabi" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+unset(CMAKE_C_COMPILER CACHE)
+unset(CMAKE_CXX_COMPILER CACHE)
+include("/usr/local/android-ndk-r25/build/cmake/android.toolchain.cmake")
