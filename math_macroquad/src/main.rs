@@ -1,18 +1,20 @@
 #![no_std]
 use macroquad::math::Vec2;
-use macroquad::miniquad::window::{quit, set_window_position, show_keyboard};
+use macroquad::miniquad::window::{quit, show_keyboard};
 use macroquad::prelude::*;
 //use std::ops::{Add, Sub};
-use instant::Instant;
 extern crate alloc;
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::fmt;
+use core::fmt::{self, Display};
+use core::num;
+use core::str::FromStr;
 extern crate simplelog;
 #[global_allocator]
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
+
 struct Config {
     cursor_blink_rate: u128,
     backspace_interval_initial: f32,
@@ -25,6 +27,7 @@ const CONFIG: Config = Config {
     backspace_interval_ramp: 0.9,
     click_distance: 2.0,
 };
+
 fn draw_rounded_rectangle(
     x: f32,
     y: f32,
@@ -90,51 +93,7 @@ fn draw_rounded_rectangle(
 
     draw_circle(x + w - radius, y + h - radius, radius, fill_color);
 }
-// impl Vec2 {
-//     fn distance(a: &Vec2, b: &Vec2) -> f32 {
-//         ((a.x - b.x).powf(2.0) + (a.y - b.y).powf(2.0)).sqrt()
-//     }
-// }
-//
-// impl Add for Vec2 {
-//     type Output = Self;
-//     fn add(self, other: Self) -> Self {
-//         Self {
-//             x: self.x + other.x,
-//             y: self.y + other.y,
-//         }
-//     }
-// }
-// impl Sub for Vec2 {
-//     type Output = Self;
-//
-//     fn sub(self, other: Self) -> Self {
-//         Self {
-//             x: self.x - other.x,
-//             y: self.y - other.y,
-//         }
-//     }
-// }
-//
-// impl From<[f32; 2]> for Vec2 {
-//     fn from(arr: [f32; 2]) -> Self {
-//         Vec2 {
-//             x: arr[0],
-//             y: arr[1],
-//         }
-//     }
-// }
-//
-// impl From<(f32, f32)> for Vec2 {
-//     fn from(arr: (f32, f32)) -> Self {
-//         Vec2 { x: arr.0, y: arr.1 }
-//     }
-// }
-// impl From<Vec2> for [f32; 2] {
-//     fn from(coords: Vec2) -> Self {
-//         [coords.x, coords.y]
-//     }
-// }
+
 trait CanvasObject {
     fn is_empty(&self) -> bool {
         true
@@ -161,7 +120,7 @@ impl CanvasObject for Comment {
         if text_input.is_ascii_graphic() || text_input.is_ascii_whitespace() {
             self.text.insert(*cursor, text_input);
             *cursor += 1;
-            info!("{}", self.text);
+            //info!("{}", self.text);
         }
     }
     fn backspace(&mut self, cursor: usize) {
@@ -227,6 +186,299 @@ impl CanvasObject for Comment {
         );
     }
 }
+#[derive(Clone)]
+enum Term {
+    Empty,
+    Cursor,
+    Numeral(u128, Option<u32>), // DIY Floating point for decimal digits
+    Negative(usize),
+    Variable(String),
+    Multiplication(Vec<usize>),
+    Addition(Vec<usize>),
+    Division(usize, usize),
+    Parentheses(usize),
+    Exponentiation(usize, usize),
+}
+#[derive(Clone)]
+struct TermNode {
+    idx: usize,
+    term: Term,
+    parent: Option<usize>,
+}
+#[derive(Debug, PartialEq, Eq)]
+struct ParseTermError;
+impl Term {
+    fn is_operator(&self) -> bool {
+        match self {
+            Self::Addition(..)
+            | Self::Negative(..)
+            | Self::Multiplication(..)
+            | Self::Division { .. }
+            | Self::Exponentiation(..) => true,
+            _ => false,
+        }
+    }
+}
+struct EquationTree {
+    arena: Vec<TermNode>,
+}
+impl EquationTree {
+    fn new() -> Self {
+        let init = Vec::from([TermNode {
+            idx: 0,
+            term: Term::Empty,
+            parent: None,
+        }]);
+        Self { arena: init }
+    }
+    fn get(&self, idx: usize) -> TermNode {
+        self.arena[idx].clone()
+    }
+
+    fn set(&mut self, idx: usize, node: TermNode) {
+        debug_assert!(self.arena.len() > idx);
+        debug_assert!(node.idx == idx);
+        self.arena[idx] = node;
+    }
+    fn set_parent(&mut self, idx: usize, parent: usize) {
+        debug_assert!(self.arena.len() > idx);
+        self.arena[idx].parent = Some(parent);
+    }
+    fn push(&mut self, mut node: TermNode) -> usize {
+        node.idx = self.arena.len();
+        self.arena.push(node);
+        self.arena.len() - 1
+    }
+    fn push_term(&mut self, term: Term, parent: usize) -> usize {
+        let node = TermNode {
+            idx: self.arena.len(),
+            parent: Some(parent),
+            term,
+        };
+        self.arena.push(node);
+        self.arena.len() - 1
+    }
+
+    fn form_mult(&mut self, original_term: TermNode, new_term: Term) -> Term {
+        let new_o_id = self.push(TermNode {
+            parent: Some(original_term.idx),
+            ..original_term
+        });
+        let new_term_id = self.push_term(new_term, original_term.idx);
+        Term::Multiplication(Vec::from([new_o_id, new_term_id]))
+    }
+    fn replace_child(&mut self, child: TermNode, new_term: Term) -> usize {
+        let new_child = self.push_term(new_term, child.parent.unwrap());
+        let parent = self.get(child.parent.unwrap());
+        match parent.term {
+            Term::Parentheses(ref child_idx) | Term::Negative(ref child_idx) => {
+                debug_assert!(*child_idx == child.idx);
+                *child_idx = new_child;
+            }
+            Term::Multiplication(ref children) | Term::Addition(ref children) => {
+                let index = children.iter().position(|&x| x == child.idx).unwrap();
+                children[index] = new_child;
+            }
+            Term::Division(ref child1, ref child2)
+            | Term::Exponentiation(ref child1, ref child2) => {
+                if *child1 == child.idx {
+                    *child1 = new_child;
+                }
+                if *child2 == child.idx {
+                    *child2 = new_child;
+                }
+            }
+            _ => {
+                panic!("ERROR: TRIED TO REPLACE CHILD OF BAD TERM");
+            }
+        };
+        new_child
+    }
+
+    /// Returns new cursor location
+    fn append_mult(&mut self, original_term: &TermNode, new_term: Term) -> usize {
+        let parent = self.get(original_term.parent.unwrap_or(0)); // Might be a bug idk
+        match parent.term {
+            Term::Multiplication(mut children) => {
+                let to_append_location = self.push_term(new_term, parent.idx);
+                children.push(to_append_location);
+                to_append_location
+            }
+            _ => {
+                let new_mult_location = original_term.idx;
+                self.set(
+                    original_term.idx,
+                    TermNode {
+                        term: Term::Multiplication(Vec::new()),
+                        ..original_term
+                    },
+                );
+                let new_o_location = self.push(original_term);
+                self.set_parent(new_o_location, new_mult_location);
+                let new_term_location = self.push_term(new_term, new_mult_location);
+                new_term_location
+            }
+        }
+    }
+}
+impl FromStr for EquationTree {
+    type Err = ParseTermError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut root = EquationTree::new();
+        let mut empty_term = Some(0);
+        let mut adding_term: Option<usize> = None;
+        let mut chars = s.chars();
+        for char in chars {
+            debug_assert!(empty_term.is_none() || adding_term.is_none());
+            if let Some(cursor) = empty_term {
+                let current_term = root.get(cursor);
+                debug_assert!(if let Term::Empty = current_term.term {
+                    true
+                } else {
+                    false
+                });
+                let new_node = TermNode {
+                    term: match char {
+                        '0'..='9' => Term::Numeral(char.to_digit(10).unwrap() as u128, None),
+                        'a'..='z' | 'A'..='Z' => Term::Variable(String::from(char)),
+
+                        '(' => Term::Parentheses(root.push_term(Term::Empty, cursor)),
+                        '-' => Term::Negative(root.push_term(Term::Empty, cursor)),
+                        '\u{FF5C}' => Term::Cursor,
+                        _ => {
+                            return Err(ParseTermError);
+                        }
+                    },
+                    ..current_term
+                };
+                root.set(cursor, new_node);
+                (empty_term, adding_term) = match char {
+                    '\u{FF5C}' | '0'..='9' | 'a'..='z' | 'A'..='Z' => (None, Some(cursor)),
+                    '(' | '-' => {
+                        if let Term::Parentheses(empty) = current_term.term {
+                            (Some(empty), None)
+                        } else if let Term::Negative(empty) = current_term.term {
+                            (Some(empty), None)
+                        } else {
+                            return Err(ParseTermError);
+                        }
+                    }
+                    _ => {
+                        return Err(ParseTermError);
+                    }
+                };
+                continue;
+            }
+            if let Some(mut cursor) = adding_term {
+                let current_term = root.get(cursor);
+                let new_node = TermNode {
+                    term: match (&current_term.term, char) {
+                        (Term::Numeral(current, None), '0'..='9') => {
+                            Term::Numeral(current * 10 + char.to_digit(10).unwrap() as u128, None)
+                        }
+                        (Term::Numeral(current, Some(exp)), '0'..='9') => Term::Numeral(
+                            current * 10 + char.to_digit(10).unwrap() as u128,
+                            Some(exp + 1),
+                        ),
+                        (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '^') => {
+                            // info!("expo attempted")
+                            Term::Exponentiation(
+                                root.push_term(current_term.term.clone(), cursor),
+                                root.push_term(Term::Empty, cursor),
+                            )
+                        }
+                        (Term::Variable(var_name), '_' | 'a'..='z' | 'A'..='Z') => {
+                            if var_name.chars().count() > 1 || char == '_' {
+                                Term::Variable(format!("{}{}", var_name, char))
+                            } else {
+                                root.append_mult(current_term, Term::Variable(char.to_string()))
+                                Term::Variable(char.to_string())
+                            }
+                        }
+                        // ( => {terms.append(other);},
+
+                        // '(' => Term::Parentheses(Box::from(Term::Empty)),
+                        // '-' => Term::Negative(Box::from(Term::Empty)),
+                        // '\u{FF5C}' => Term::Cursor,
+                        _ => {
+                            return Err(ParseTermError);
+                        }
+                    },
+                    ..current_term
+                };
+                (empty_term, adding_term) = match char {
+                    '\u{FF5C}' | '0'..='9' | 'a'..='z' | 'A'..='Z' | '_' => (None, Some(cursor)),
+                    '(' | '-' | '^' => match new_node.term {
+                        Term::Parentheses(empty)
+                        | Term::Negative(empty)
+                        | Term::Exponentiation(_, empty) => (Some(empty), None),
+                        _ => {
+                            return Err(ParseTermError);
+                        }
+                    },
+
+                    _ => {
+                        return Err(ParseTermError);
+                    }
+                };
+
+                root.set(cursor, new_node);
+            }
+        }
+        Ok(root)
+    }
+}
+
+impl TermNode {
+    fn to_string(&self, tree: &EquationTree) -> String {
+        use Term::*;
+        match &self.term {
+            Empty => "(Empty)".to_string(),
+            Cursor => "(Cursor)".to_string(),
+            Numeral(num, exp) => {
+                format!(
+                    "Num[{}]",
+                    (*num as f64 / (u128::pow(10, exp.unwrap_or(0)) as f64))
+                )
+            }
+
+            Variable(name) => format!("Var[{}]", name.clone()),
+            Parentheses(term) => format!("({})", tree.get(*term).to_string(tree)),
+            Negative(term) => format!("Negative({})", tree.get(*term).to_string(tree)),
+            Multiplication(terms) => format!(
+                "Multiplication({})",
+                terms.iter().fold(String::new(), |acc, &term| format!(
+                    "{}{},",
+                    acc,
+                    tree.get(term).to_string(tree)
+                ))
+            ),
+            Addition(terms) => format!(
+                "Addition({})",
+                terms.iter().fold(String::new(), |acc, &term| format!(
+                    "{}{},",
+                    acc,
+                    tree.get(term).to_string(tree)
+                ))
+            ),
+            Division(term, term2) => format!(
+                "Division({}/{})",
+                tree.get(*term).to_string(tree),
+                tree.get(*term2).to_string(tree)
+            ),
+            Exponentiation(term, term2) => format!(
+                "Exponentiation({}^{})",
+                tree.get(*term).to_string(tree),
+                tree.get(*term2).to_string(tree)
+            ),
+        }
+    }
+}
+impl Display for EquationTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "EquationTree:\n{}", self.get(0).to_string(self))
+    }
+}
 /// A Mathematical Equation on the Canvas
 struct Equation {
     text: String,
@@ -235,6 +487,15 @@ struct Equation {
 
 impl Equation {
     const FONT_SIZE: u16 = 33;
+    fn replace_symbols(&self) -> String {
+        Equation::replace_symbols_str(&self.text)
+    }
+
+    fn replace_symbols_str(text: &String) -> String {
+        text.replace("pi", "\u{03C0}")
+            .replace("theta", "\u{03B8}")
+            .replace("*", "\u{00B7}")
+    }
 }
 impl CanvasObject for Equation {
     fn is_empty(&self) -> bool {
@@ -244,7 +505,7 @@ impl CanvasObject for Equation {
         if text_input.is_ascii_graphic() || text_input.is_ascii_whitespace() {
             self.text.insert(*cursor, text_input);
             *cursor += 1;
-            info!("{}", self.text);
+            // info!("{}", self.text);
         }
     }
     fn backspace(&mut self, cursor: usize) {
@@ -253,7 +514,8 @@ impl CanvasObject for Equation {
     fn draw(&self, fonts: &mut Fonts) {
         let font = &mut fonts.equations;
 
-        let text_dimensions = measure_text(&self.text[..], Some(font), Comment::FONT_SIZE, 1.0);
+        let text_to_draw = self.replace_symbols();
+        let text_dimensions = measure_text(&text_to_draw[..], Some(font), Comment::FONT_SIZE, 1.0);
 
         draw_rectangle(
             self.pos.x,
@@ -264,7 +526,7 @@ impl CanvasObject for Equation {
         );
 
         draw_text_ex(
-            &self.text[..],
+            &text_to_draw[..],
             self.pos.x,
             self.pos.y,
             TextParams {
@@ -279,14 +541,21 @@ impl CanvasObject for Equation {
     fn edit_draw(&self, cursor: usize, fonts: &mut Fonts) {
         let font = &mut fonts.equations;
         let mut text_to_draw = self.text.clone();
+
+        let equation_tree = EquationTree::from_str(&self.text[..]);
+        match equation_tree {
+            Ok(tree) => info!("{}", tree),
+            Err(_) => info!("Parsing Error :("),
+        }
         let time = instant::now();
         let cursor_visible = (time as u128 / CONFIG.cursor_blink_rate) % 2 == 0;
         if cursor_visible {
             //info!("cursor: {}-{:?}", cursor, text_to_draw);
-            text_to_draw.insert(cursor, '|');
+            text_to_draw.insert(cursor, '\u{FF5C}');
         }
-        let text_dimensions = measure_text(&self.text[..], Some(font), Comment::FONT_SIZE, 1.0);
 
+        let text_to_draw = Equation::replace_symbols_str(&self.text);
+        let text_dimensions = measure_text(&text_to_draw[..], Some(font), Comment::FONT_SIZE, 1.0);
         draw_rectangle(
             self.pos.x,
             self.pos.y - (Comment::FONT_SIZE as f32),
@@ -391,10 +660,9 @@ impl Canvas {
     }
     fn is_click(&self) -> bool {
         match &self.state {
-            CanvasState::DraggingCanvas {
-                start_offset,
-                start_drag,
-            } => Vec2::distance(*start_offset, self.camera.target.clone()) < 2.0,
+            CanvasState::DraggingCanvas { start_offset, .. } => {
+                Vec2::distance(*start_offset, self.camera.target.clone()) < CONFIG.click_distance
+            }
             _ => false,
         }
     }
@@ -404,10 +672,10 @@ impl Canvas {
             editing_object,
         };
         show_keyboard(true);
-        info!(
-            "Inserted at {:?}",
-            Vec2::from(mouse_position()) + self.camera.target.clone()
-        );
+        // info!(
+        //     "Inserted at {:?}",
+        //     Vec2::from(mouse_position()) + self.camera.target.clone()
+        // );
     }
 
     fn handle_typing(&mut self, text: char) {
@@ -494,6 +762,7 @@ struct Fonts {
     equations: Font,
     comments: Font,
 }
+#[derive(Clone)]
 enum Tool {
     Equation,
     Comment,
@@ -501,6 +770,7 @@ enum Tool {
 struct ToolButton {
     position: Vec2,
     symbol: Texture2D,
+    tool: Tool,
 }
 
 impl ToolButton {
@@ -555,8 +825,8 @@ impl State {
         match self.tool {
             Tool::Comment | Tool::Equation => {
                 if is_mouse_button_pressed(MouseButton::Left) {
-                    self.canvas.start_drag();
                     self.canvas.insert_object_if_editing();
+                    self.canvas.start_drag();
                 }
 
                 if is_mouse_button_released(MouseButton::Left) {
@@ -574,8 +844,9 @@ impl State {
                                 });
                         match tool_index {
                             Some(index) => {
-                                info!("ToolIndex: {}", index);
+                                //info!("ToolIndex: {}", index);
                                 self.canvas.state = CanvasState::Default;
+                                self.tool = self.tool_buttons[index].tool.clone();
                             }
                             None => match self.tool {
                                 Tool::Comment => {
@@ -651,7 +922,8 @@ async fn main() {
     simplelog::SimpleLogger::init(simplelog::LevelFilter::Info, simplelog::Config::default());
     //    #[cfg(target_arch = "wasm32")]
 
-    let equation_font = load_ttf_font_from_bytes(include_bytes!("../assets/cmunso.ttf")).unwrap();
+    let equation_font =
+        load_ttf_font_from_bytes(include_bytes!("../assets/Symbola_hint.ttf")).unwrap();
     let comment_font = load_ttf_font_from_bytes(include_bytes!("../assets/cmunbsr.ttf")).unwrap();
 
     let mut app_state = State {
@@ -671,9 +943,16 @@ async fn main() {
     app_state.tool_buttons.push(ToolButton {
         position: Vec2::new(50., 50.),
         symbol: load_texture("assets/sigma.png").await.unwrap(),
+        tool: Tool::Equation,
     });
+    app_state.tool_buttons.push(ToolButton {
+        position: Vec2::new(200., 50.),
+        symbol: load_texture("assets/comment.png").await.unwrap(),
+        tool: Tool::Comment,
+    });
+
     //set_window_position(500, 0);
-    set_fullscreen(true);
+    // set_fullscreen(true);
     loop {
         clear_background(WHITE);
         app_state.update();
