@@ -8,6 +8,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 use core::fmt::{self, Display};
 use core::num;
 use core::str::FromStr;
@@ -20,14 +21,34 @@ struct Config {
     backspace_interval_initial: f32,
     backspace_interval_ramp: f32,
     click_distance: f32,
+    exponentiation_scale_factor: f32,
+    division_scale_factor: f32,
+    division_padding: (f32, f32),
+    equation_font_size: u16,
 }
 const CONFIG: Config = Config {
     cursor_blink_rate: 500,
     backspace_interval_initial: 0.1,
     backspace_interval_ramp: 0.9,
     click_distance: 2.0,
+    exponentiation_scale_factor: 0.8,
+    division_scale_factor: 0.95,
+    division_padding: (5.0, 5.0),
+    equation_font_size: 60,
 };
 
+fn max_f32(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else {
+        match a.partial_cmp(&b).unwrap_or(Ordering::Equal) {
+            Ordering::Less => b,
+            _ => a,
+        }
+    }
+}
 fn draw_rounded_rectangle(
     x: f32,
     y: f32,
@@ -200,10 +221,33 @@ enum Term {
     Exponentiation(usize, usize),
 }
 #[derive(Clone)]
+struct TNRenderData {
+    w: f32,
+    h: f32,
+}
+impl From<TextDimensions> for TNRenderData {
+    fn from(value: TextDimensions) -> Self {
+        Self {
+            w: value.width,
+            h: value.height,
+        }
+    }
+}
+
+impl From<(TextDimensions, f32)> for TNRenderData {
+    fn from(value: (TextDimensions, f32)) -> Self {
+        Self {
+            w: value.0.width,
+            h: value.1,
+        }
+    }
+}
+#[derive(Clone)]
 struct TermNode {
     idx: usize,
     term: Term,
     parent: Option<usize>,
+    render_data: Option<TNRenderData>,
 }
 #[derive(Debug, PartialEq, Eq)]
 struct ParseTermError;
@@ -228,6 +272,7 @@ impl EquationTree {
             idx: 0,
             term: Term::Empty,
             parent: None,
+            render_data: None,
         }]);
         Self { arena: init }
     }
@@ -240,9 +285,20 @@ impl EquationTree {
         debug_assert!(node.idx == idx);
         self.arena[idx] = node;
     }
+    fn update_node(&mut self, node: TermNode) {
+        self.set(node.idx, node);
+    }
+    fn set_term(&mut self, idx: usize, term: Term) {
+        self.arena[idx].term = term;
+    }
     fn set_parent(&mut self, idx: usize, parent: usize) {
         debug_assert!(self.arena.len() > idx);
         self.arena[idx].parent = Some(parent);
+    }
+
+    fn set_render_data(&mut self, idx: usize, data: TNRenderData) {
+        debug_assert!(self.arena.len() > idx);
+        self.arena[idx].render_data = Some(data);
     }
     fn push(&mut self, mut node: TermNode) -> usize {
         node.idx = self.arena.len();
@@ -254,37 +310,47 @@ impl EquationTree {
             idx: self.arena.len(),
             parent: Some(parent),
             term,
+            render_data: None,
         };
         self.arena.push(node);
         self.arena.len() - 1
     }
 
-    fn form_mult(&mut self, original_term: TermNode, new_term: Term) -> Term {
-        let new_o_id = self.push(TermNode {
-            parent: Some(original_term.idx),
-            ..original_term
-        });
-        let new_term_id = self.push_term(new_term, original_term.idx);
-        Term::Multiplication(Vec::from([new_o_id, new_term_id]))
+    fn push_term_np(&mut self, term: Term) -> usize {
+        let node = TermNode {
+            idx: self.arena.len(),
+            parent: None,
+            term,
+            render_data: None,
+        };
+        self.arena.push(node);
+        self.arena.len() - 1
     }
+    // fn form_mult(&mut self, original_term: TermNode, new_term: Term) -> Term {
+    //     let new_o_id = self.push(TermNode {
+    //         parent: Some(original_term.idx),
+    //         ..original_term
+    //     });
+    //     let new_term_id = self.push_term(new_term, original_term.idx);
+    //     Term::Multiplication(Vec::from([new_o_id, new_term_id]))
+    // }
     fn replace_child(&mut self, child: TermNode, new_term: Term) -> usize {
         let new_child = self.push_term(new_term, child.parent.unwrap());
-        let parent = self.get(child.parent.unwrap());
+        let mut parent = self.get(child.parent.unwrap());
         match parent.term {
-            Term::Parentheses(ref child_idx) | Term::Negative(ref child_idx) => {
+            Term::Parentheses(ref mut child_idx) | Term::Negative(ref mut child_idx) => {
                 debug_assert!(*child_idx == child.idx);
                 *child_idx = new_child;
             }
-            Term::Multiplication(ref children) | Term::Addition(ref children) => {
+            Term::Multiplication(ref mut children) | Term::Addition(ref mut children) => {
                 let index = children.iter().position(|&x| x == child.idx).unwrap();
                 children[index] = new_child;
             }
-            Term::Division(ref child1, ref child2)
-            | Term::Exponentiation(ref child1, ref child2) => {
+            Term::Division(ref mut child1, ref mut child2)
+            | Term::Exponentiation(ref mut child1, ref mut child2) => {
                 if *child1 == child.idx {
                     *child1 = new_child;
-                }
-                if *child2 == child.idx {
+                } else if *child2 == child.idx {
                     *child2 = new_child;
                 }
             }
@@ -296,29 +362,356 @@ impl EquationTree {
     }
 
     /// Returns new cursor location
-    fn append_mult(&mut self, original_term: &TermNode, new_term: Term) -> usize {
-        let parent = self.get(original_term.parent.unwrap_or(0)); // Might be a bug idk
+    fn append_mult(&mut self, original_term: TermNode, new_term: Term) -> usize {
+        let mut parent = self.get(original_term.parent.unwrap_or(0)); // Might be a bug idk
         match parent.term {
-            Term::Multiplication(mut children) => {
+            Term::Multiplication(ref mut children) => {
                 let to_append_location = self.push_term(new_term, parent.idx);
                 children.push(to_append_location);
+                self.update_node(parent);
                 to_append_location
             }
             _ => {
                 let new_mult_location = original_term.idx;
-                self.set(
-                    original_term.idx,
-                    TermNode {
-                        term: Term::Multiplication(Vec::new()),
-                        ..original_term
-                    },
-                );
                 let new_o_location = self.push(original_term);
                 self.set_parent(new_o_location, new_mult_location);
                 let new_term_location = self.push_term(new_term, new_mult_location);
+                self.set_term(
+                    new_mult_location,
+                    Term::Multiplication(Vec::from([new_o_location, new_term_location])),
+                );
                 new_term_location
             }
         }
+    }
+    fn get_mid_line_idx(&self, idx: usize) -> f32 {
+        self.get_mid_line(self.get(idx))
+    }
+    fn get_mid_line(&self, target: TermNode) -> f32 {
+        let render_data = target.render_data.unwrap();
+        match target.term {
+            Term::Division(_num, denom) => render_data.h - self.get(denom).render_data.unwrap().h,
+            _ => render_data.h / 2.0,
+        }
+    }
+    fn render(
+        &mut self,
+        target: Option<usize>,
+        scale_factor: f32,
+        font: Option<&Font>,
+        top_left_pos: Vec2,
+    ) {
+        let font_size = CONFIG.equation_font_size;
+        let text_height = measure_text(" | ", font, font_size, scale_factor).height;
+        let current_node = self.get(target.unwrap_or(0));
+        if let None = current_node.render_data {
+            info!("Filling Data");
+            debug_assert!(target.unwrap_or(0) == 0);
+            self.fill_render_data(target, scale_factor, font);
+        }
+        let current_node = self.get(target.unwrap_or(0));
+        let current_data = current_node.render_data.unwrap();
+        #[cfg(debug_assertions)]
+        draw_rectangle(
+            top_left_pos.x,
+            top_left_pos.y,
+            current_data.w,
+            current_data.h,
+            color_u8!(0, 0, 0, 50),
+        );
+        use Term::*;
+        let bottom_left_pos = Vec2::new(top_left_pos.x, top_left_pos.y + current_data.h);
+        let text_params = TextParams {
+            font_size: CONFIG.equation_font_size,
+            font,
+            font_scale: scale_factor,
+            color: color_u8!(0, 0, 0, 255),
+            ..Default::default()
+        };
+        match current_node.term {
+            Empty => {
+                draw_text_ex(
+                    " | ",
+                    top_left_pos.x,
+                    top_left_pos.y + text_height,
+                    text_params,
+                );
+                info!("drawing at {}", bottom_left_pos)
+            }
+
+            Cursor => draw_text_ex(
+                " | ",
+                top_left_pos.x,
+                top_left_pos.y + text_height,
+                text_params,
+            ),
+            Numeral(num, exp) => draw_text_ex(
+                &(num as f64 / (u128::pow(10, exp.unwrap_or(0)) as f64)).to_string()[..],
+                top_left_pos.x,
+                top_left_pos.y + text_height,
+                text_params,
+            ),
+
+            Variable(var_name) => draw_text_ex(
+                &var_name,
+                top_left_pos.x,
+                top_left_pos.y + text_height,
+                text_params,
+            ),
+            Negative(child) => {
+                draw_text_ex("-", bottom_left_pos.x, bottom_left_pos.y, text_params);
+                let negative_size = measure_text("-", font, font_size, scale_factor);
+                self.render(
+                    Some(child),
+                    scale_factor,
+                    font,
+                    Vec2::new(negative_size.width + bottom_left_pos.x, top_left_pos.y),
+                );
+            }
+            Parentheses(child) => {
+                draw_text_ex(
+                    "(",
+                    bottom_left_pos.x,
+                    bottom_left_pos.y,
+                    text_params.clone(),
+                );
+                let parentheses_size = measure_text("(", font, font_size, scale_factor);
+                self.render(
+                    Some(child),
+                    scale_factor,
+                    font,
+                    Vec2::new(parentheses_size.width + bottom_left_pos.x, top_left_pos.y),
+                );
+                let child_node_data = self.get(child).render_data.unwrap();
+                draw_text_ex(
+                    ")",
+                    bottom_left_pos.x + parentheses_size.width + child_node_data.w,
+                    bottom_left_pos.y,
+                    text_params,
+                );
+            }
+            Addition(children) => {
+                let first = children[0];
+
+                let mut combined_w = 0.0;
+                for child_id in children {
+                    let child = self.get(child_id);
+                    let child_dims = child.render_data.unwrap();
+
+                    if child.idx != first {
+                        combined_w += if let Negative(gchild) = child.term {
+                            draw_text_ex(
+                                " - ",
+                                bottom_left_pos.x + combined_w,
+                                bottom_left_pos.y,
+                                text_params.clone(),
+                            );
+                            self.render(
+                                Some(gchild),
+                                scale_factor,
+                                font,
+                                Vec2::new(
+                                    top_left_pos.x
+                                        + measure_text(" - ", font, font_size, scale_factor).width
+                                        + combined_w,
+                                    top_left_pos.y,
+                                ),
+                            );
+                            measure_text(" - ", font, font_size, scale_factor).width
+                                + self.get(gchild).render_data.unwrap().w // omit negative sign bc
+                                                                          // we are doing it here
+                        } else {
+                            draw_text_ex(
+                                " + ",
+                                bottom_left_pos.x + combined_w,
+                                bottom_left_pos.y,
+                                text_params.clone(),
+                            );
+                            self.render(
+                                Some(child.idx),
+                                scale_factor,
+                                font,
+                                Vec2::new(
+                                    top_left_pos.x
+                                        + measure_text(" + ", font, font_size, scale_factor).width
+                                        + combined_w,
+                                    top_left_pos.y,
+                                ),
+                            );
+                            measure_text(" + ", font, font_size, scale_factor).width + child_dims.w
+                        }
+                    } else {
+                        self.render(
+                            Some(child.idx),
+                            scale_factor,
+                            font,
+                            Vec2::new(top_left_pos.x + combined_w, top_left_pos.y),
+                        );
+                        combined_w += child_dims.w;
+                    }
+                }
+            }
+
+            Multiplication(children) => {
+                let mut combined_w = 0.0;
+                for child_id in children {
+                    let child = self.get(child_id);
+                    let child_dims = child.render_data.unwrap();
+                    self.render(
+                        Some(child.idx),
+                        scale_factor,
+                        font,
+                        Vec2::new(top_left_pos.x + combined_w, top_left_pos.y),
+                    );
+                    combined_w += child_dims.w;
+                }
+            }
+            Exponentiation(base, child) => {
+                let base_node_data = self.get(base).render_data.unwrap();
+                let child_node_data = self.get(child).render_data.unwrap();
+                self.render(
+                    Some(base),
+                    scale_factor,
+                    font,
+                    Vec2::new(
+                        top_left_pos.x,
+                        top_left_pos.y + child_node_data.h + text_height / 2.0
+                            - base_node_data.h
+                            - 1.0,
+                    ),
+                );
+                self.render(
+                    Some(child),
+                    scale_factor * CONFIG.exponentiation_scale_factor,
+                    font,
+                    Vec2::new(top_left_pos.x + base_node_data.w, top_left_pos.y),
+                );
+            }
+            //
+            // Division(numerator, denominator) => {
+            //     self.fill_render_data(Some(numerator), scale_factor, font);
+            //     self.fill_render_data(
+            //         Some(denominator),
+            //         scale_factor * CONFIG.exponentiation_scale_factor,
+            //         font,
+            //     );
+            //     let num_data = self.get(denominator).render_data.unwrap();
+            //     let denom_data = self.get(denominator).render_data.unwrap();
+            //     TNRenderData {
+            //         w: max_f32(num_data.w, denom_data.w) + CONFIG.division_padding.0,
+            //         h: denom_data.h + num_data.h + CONFIG.division_padding.1,
+            //     }
+            // }
+            _ => {
+                panic!("You forgot to implement a path silly ah coder")
+            }
+        };
+    }
+    fn fill_render_data(&mut self, target: Option<usize>, scale_factor: f32, font: Option<&Font>) {
+        use Term::*;
+        let font_size = CONFIG.equation_font_size;
+        let text_height = measure_text(" | ", font, font_size, scale_factor).height;
+        let current_node = self.get(target.unwrap_or(0));
+        let new_render_data = match current_node.term {
+            Empty => TNRenderData::from(measure_text(" | ", font, font_size, scale_factor)),
+            Cursor => TNRenderData::from(measure_text("|", font, font_size, scale_factor)),
+            Numeral(num, exp) => TNRenderData::from((
+                measure_text(
+                    &(num as f64 / (u128::pow(10, exp.unwrap_or(0)) as f64)).to_string()[..],
+                    font,
+                    font_size,
+                    scale_factor,
+                ),
+                text_height,
+            )),
+            Variable(var_name) => TNRenderData::from((
+                measure_text(&var_name[..], font, font_size, scale_factor),
+                text_height,
+            )),
+            Negative(child) => {
+                let negative_size = measure_text("-", font, font_size, scale_factor);
+                self.fill_render_data(Some(child), scale_factor, font);
+                let child_node_data = self.get(child).render_data.unwrap();
+                TNRenderData {
+                    w: negative_size.width + child_node_data.w,
+                    h: max_f32(negative_size.height, child_node_data.h),
+                }
+            }
+            Parentheses(child) => {
+                let parentheses_size = measure_text("()", font, font_size, scale_factor);
+                self.fill_render_data(Some(child), scale_factor, font);
+                let child_node_data = self.get(child).render_data.unwrap();
+                TNRenderData {
+                    w: parentheses_size.width + child_node_data.w,
+                    h: max_f32(parentheses_size.height, child_node_data.h),
+                }
+            }
+            Addition(children) => {
+                let mut dims = TNRenderData { w: 0.0, h: 0.0 };
+                let first = children[0];
+                for child_id in children {
+                    self.fill_render_data(Some(child_id), scale_factor, font);
+                    let child = self.get(child_id);
+                    let child_dims = child.render_data.unwrap();
+
+                    if child.idx != first {
+                        dims.w += if let Negative(gchild) = child.term {
+                            measure_text(" - ", font, font_size, scale_factor).width
+                                + self.get(gchild).render_data.unwrap().w // omit negative sign bc
+                                                                          // we are doing it here
+                        } else {
+                            measure_text(" + ", font, font_size, scale_factor).width + child_dims.w
+                        }
+                    }
+                    dims.h = max_f32(dims.h, child_dims.h);
+                }
+                dims
+            }
+
+            Multiplication(children) => {
+                let mut dims = TNRenderData { w: 0.0, h: 0.0 };
+                for child_id in children {
+                    self.fill_render_data(Some(child_id), scale_factor, font);
+                    let child = self.get(child_id);
+                    let child_dims = child.render_data.unwrap();
+                    dims.w += child_dims.w;
+                    dims.h = max_f32(dims.h, child_dims.h);
+                }
+                dims
+            }
+            Exponentiation(base, child) => {
+                self.fill_render_data(Some(base), scale_factor, font);
+                self.fill_render_data(
+                    Some(child),
+                    scale_factor * CONFIG.exponentiation_scale_factor,
+                    font,
+                );
+                let child_node_data = self.get(child).render_data.unwrap();
+                let base_node_data = self.get(base).render_data.unwrap();
+                TNRenderData {
+                    w: base_node_data.w + child_node_data.w,
+                    h: child_node_data.h + text_height / 2.0 - 1.0,
+                }
+            }
+
+            Division(numerator, denominator) => {
+                self.fill_render_data(Some(numerator), scale_factor, font);
+                self.fill_render_data(
+                    Some(denominator),
+                    scale_factor * CONFIG.exponentiation_scale_factor,
+                    font,
+                );
+                let num_data = self.get(denominator).render_data.unwrap();
+                let denom_data = self.get(denominator).render_data.unwrap();
+                TNRenderData {
+                    w: max_f32(num_data.w, denom_data.w) + CONFIG.division_padding.0,
+                    h: denom_data.h + num_data.h + CONFIG.division_padding.1,
+                }
+            }
+        };
+
+        self.set_render_data(target.unwrap_or(0), new_render_data);
+        debug_assert!(self.get(target.unwrap_or(0)).render_data.is_some())
     }
 }
 impl FromStr for EquationTree {
@@ -351,13 +744,12 @@ impl FromStr for EquationTree {
                     },
                     ..current_term
                 };
-                root.set(cursor, new_node);
                 (empty_term, adding_term) = match char {
                     '\u{FF5C}' | '0'..='9' | 'a'..='z' | 'A'..='Z' => (None, Some(cursor)),
                     '(' | '-' => {
-                        if let Term::Parentheses(empty) = current_term.term {
+                        if let Term::Parentheses(empty) = new_node.term {
                             (Some(empty), None)
-                        } else if let Term::Negative(empty) = current_term.term {
+                        } else if let Term::Negative(empty) = new_node.term {
                             (Some(empty), None)
                         } else {
                             return Err(ParseTermError);
@@ -367,62 +759,184 @@ impl FromStr for EquationTree {
                         return Err(ParseTermError);
                     }
                 };
+                root.set(cursor, new_node);
                 continue;
             }
-            if let Some(mut cursor) = adding_term {
+            if let Some(cursor) = adding_term {
                 let current_term = root.get(cursor);
-                let new_node = TermNode {
-                    term: match (&current_term.term, char) {
-                        (Term::Numeral(current, None), '0'..='9') => {
-                            Term::Numeral(current * 10 + char.to_digit(10).unwrap() as u128, None)
-                        }
-                        (Term::Numeral(current, Some(exp)), '0'..='9') => Term::Numeral(
+                match (current_term.term.clone(), char) {
+                    (Term::Numeral(current, None), '0'..='9') => root.set_term(
+                        cursor,
+                        Term::Numeral(current * 10 + char.to_digit(10).unwrap() as u128, None),
+                    ),
+
+                    (Term::Numeral(current, None), '.') => {
+                        root.set_term(cursor, Term::Numeral(current, Some(0)))
+                    }
+                    (Term::Numeral(current, Some(exp)), '0'..='9') => root.set_term(
+                        cursor,
+                        Term::Numeral(
                             current * 10 + char.to_digit(10).unwrap() as u128,
                             Some(exp + 1),
                         ),
-                        (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '^') => {
-                            // info!("expo attempted")
-                            Term::Exponentiation(
-                                root.push_term(current_term.term.clone(), cursor),
-                                root.push_term(Term::Empty, cursor),
-                            )
+                    ),
+                    (Term::Numeral(..), 'a'..='z' | 'A'..='Z') => {
+                        let new_var_term =
+                            root.append_mult(current_term, Term::Variable(char.to_string()));
+                        adding_term = Some(new_var_term);
+                    }
+                    (Term::Variable(var_name), '_' | 'a'..='z' | 'A'..='Z') => {
+                        if var_name.chars().count() > 1 || char == '_' {
+                            root.set_term(cursor, Term::Variable(format!("{}{}", var_name, char)));
+                        } else {
+                            let new_var_term =
+                                root.append_mult(current_term, Term::Variable(char.to_string()));
+                            adding_term = Some(new_var_term);
                         }
-                        (Term::Variable(var_name), '_' | 'a'..='z' | 'A'..='Z') => {
-                            if var_name.chars().count() > 1 || char == '_' {
-                                Term::Variable(format!("{}{}", var_name, char))
+                    }
+                    (Term::Variable(var_name), '0'..='9') => {
+                        if var_name.chars().count() > 1 {
+                            root.set_term(cursor, Term::Variable(format!("{}{}", var_name, char)));
+                        } else {
+                            let new_num_term = root.append_mult(
+                                current_term,
+                                Term::Numeral(char.to_digit(10).unwrap() as u128, None),
+                            );
+                            adding_term = Some(new_num_term);
+                        }
+                    }
+                    (Term::Parentheses(..), 'a'..='z' | 'A'..='Z') => {
+                        let new_var_term =
+                            root.append_mult(current_term, Term::Variable(char.to_string()));
+                        adding_term = Some(new_var_term);
+                    }
+                    (Term::Parentheses(..), '0'..='9') => {
+                        let new_num_term = root.append_mult(
+                            current_term,
+                            Term::Numeral(char.to_digit(10).unwrap() as u128, None),
+                        );
+                        adding_term = Some(new_num_term);
+                    }
+
+                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '^') => {
+                        // info!("expo attempted")
+                        let new_empty = root.push_term(Term::Empty, cursor);
+                        let new_term = Term::Exponentiation(
+                            root.push_term(current_term.term.clone(), cursor),
+                            new_empty,
+                        );
+                        root.set_term(cursor, new_term);
+                        empty_term = Some(new_empty);
+                        adding_term = None;
+                    }
+                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), ')') => {
+                        let mut current = current_term;
+                        loop {
+                            if let Some(parent) = current.parent {
+                                current = root.get(parent);
+                                if let Term::Parentheses(..) = current.term {
+                                    break;
+                                }
                             } else {
-                                root.append_mult(current_term, Term::Variable(char.to_string()))
-                                Term::Variable(char.to_string())
+                                break;
                             }
                         }
-                        // ( => {terms.append(other);},
+                        empty_term = None;
+                        adding_term = Some(current.idx);
+                    }
+                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '/') => {
+                        let denominator_location = root.push_term(Term::Empty, cursor);
+                        let mut numerator = current_term;
 
-                        // '(' => Term::Parentheses(Box::from(Term::Empty)),
-                        // '-' => Term::Negative(Box::from(Term::Empty)),
-                        // '\u{FF5C}' => Term::Cursor,
-                        _ => {
-                            return Err(ParseTermError);
+                        loop {
+                            if let Some(parent) = numerator.parent {
+                                let next_parent = root.get(parent);
+                                if let Term::Multiplication(..) = next_parent.term {
+                                    numerator = next_parent;
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
                         }
-                    },
-                    ..current_term
-                };
-                (empty_term, adding_term) = match char {
-                    '\u{FF5C}' | '0'..='9' | 'a'..='z' | 'A'..='Z' | '_' => (None, Some(cursor)),
-                    '(' | '-' | '^' => match new_node.term {
-                        Term::Parentheses(empty)
-                        | Term::Negative(empty)
-                        | Term::Exponentiation(_, empty) => (Some(empty), None),
-                        _ => {
-                            return Err(ParseTermError);
+                        let new_term = Term::Division(
+                            root.push_term(numerator.term.clone(), cursor),
+                            denominator_location,
+                        );
+                        root.set_term(numerator.idx, new_term);
+                        empty_term = Some(denominator_location);
+                        adding_term = None;
+                    }
+                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '+') => {
+                        let mut parent = root.get(current_term.parent.unwrap_or(0)); // Might be a bug idk
+                        match parent.term {
+                            Term::Addition(ref mut children) => {
+                                let to_append_location = root.push_term(Term::Empty, parent.idx);
+                                children.push(to_append_location);
+                                root.update_node(parent);
+                                empty_term = Some(to_append_location);
+                            }
+                            _ => {
+                                let new_mult_location = current_term.idx;
+                                let new_o_location = root.push(current_term);
+                                root.set_parent(new_o_location, new_mult_location);
+                                let new_term_location =
+                                    root.push_term(Term::Empty, new_mult_location);
+                                root.set_term(
+                                    new_mult_location,
+                                    Term::Addition(Vec::from([new_o_location, new_term_location])),
+                                );
+                                empty_term = Some(new_term_location);
+                            }
                         }
-                    },
+                        adding_term = None;
+                    }
 
+                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '-') => {
+                        let mut parent = root.get(current_term.parent.unwrap_or(0)); // Might be a bug idk
+                        match parent.term {
+                            Term::Addition(ref mut children) => {
+                                let new_empty_location = root.push_term_np(Term::Empty);
+                                let to_append_location =
+                                    root.push_term(Term::Negative(new_empty_location), parent.idx);
+
+                                root.set_parent(new_empty_location, to_append_location);
+                                children.push(to_append_location);
+                                root.update_node(parent);
+                                empty_term = Some(new_empty_location);
+                            }
+                            _ => {
+                                let new_mult_location = current_term.idx;
+                                let new_o_location = root.push(current_term);
+                                root.set_parent(new_o_location, new_mult_location);
+
+                                let new_empty_location = root.push_term_np(Term::Empty);
+                                let to_append_location = root.push_term(
+                                    Term::Negative(new_empty_location),
+                                    new_mult_location,
+                                );
+                                root.set_parent(new_empty_location, to_append_location);
+
+                                root.set_term(
+                                    new_mult_location,
+                                    Term::Addition(Vec::from([new_o_location, to_append_location])),
+                                );
+                                empty_term = Some(new_empty_location);
+                            }
+                        }
+                        adding_term = None;
+                    }
+
+                    // ( => {terms.append(other);},
+
+                    // '(' => Term::Parentheses(Box::from(Term::Empty)),
+                    // '-' => Term::Negative(Box::from(Term::Empty)),
+                    // '\u{FF5C}' => Term::Cursor,
                     _ => {
                         return Err(ParseTermError);
                     }
                 };
-
-                root.set(cursor, new_node);
             }
         }
         Ok(root)
@@ -474,6 +988,7 @@ impl TermNode {
         }
     }
 }
+
 impl Display for EquationTree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "EquationTree:\n{}", self.get(0).to_string(self))
@@ -486,7 +1001,6 @@ struct Equation {
 }
 
 impl Equation {
-    const FONT_SIZE: u16 = 33;
     fn replace_symbols(&self) -> String {
         Equation::replace_symbols_str(&self.text)
     }
@@ -515,7 +1029,12 @@ impl CanvasObject for Equation {
         let font = &mut fonts.equations;
 
         let text_to_draw = self.replace_symbols();
-        let text_dimensions = measure_text(&text_to_draw[..], Some(font), Comment::FONT_SIZE, 1.0);
+        let text_dimensions = measure_text(
+            &text_to_draw[..],
+            Some(font),
+            CONFIG.equation_font_size,
+            1.0,
+        );
 
         draw_rectangle(
             self.pos.x,
@@ -544,39 +1063,42 @@ impl CanvasObject for Equation {
 
         let equation_tree = EquationTree::from_str(&self.text[..]);
         match equation_tree {
-            Ok(tree) => info!("{}", tree),
+            Ok(mut tree) => {
+                info!("{}", tree);
+                tree.render(None, 1.0, Some(font), self.pos);
+            }
             Err(_) => info!("Parsing Error :("),
         }
-        let time = instant::now();
-        let cursor_visible = (time as u128 / CONFIG.cursor_blink_rate) % 2 == 0;
-        if cursor_visible {
-            //info!("cursor: {}-{:?}", cursor, text_to_draw);
-            text_to_draw.insert(cursor, '\u{FF5C}');
-        }
-
-        let text_to_draw = Equation::replace_symbols_str(&self.text);
-        let text_dimensions = measure_text(&text_to_draw[..], Some(font), Comment::FONT_SIZE, 1.0);
-        draw_rectangle(
-            self.pos.x,
-            self.pos.y - (Comment::FONT_SIZE as f32),
-            text_dimensions.width + (Comment::FONT_SIZE) as f32,
-            Comment::FONT_SIZE as f32 * 1.2,
-            color_u8!(0, 0, 0, 10),
-        );
-
-        draw_text_ex(
-            &text_to_draw[..],
-            self.pos.x,
-            self.pos.y,
-            TextParams {
-                font: Some(font),
-                font_size: Comment::FONT_SIZE,
-                font_scale: 1.0,
-                font_scale_aspect: 1.0,
-                rotation: 0.0,
-                color: color_u8!(0, 0, 0, 255),
-            },
-        );
+        // let time = instant::now();
+        // let cursor_visible = (time as u128 / CONFIG.cursor_blink_rate) % 2 == 0;
+        // if cursor_visible {
+        //     //info!("cursor: {}-{:?}", cursor, text_to_draw);
+        //     text_to_draw.insert(cursor, '\u{FF5C}');
+        // }
+        //
+        // let text_to_draw = Equation::replace_symbols_str(&self.text);
+        // let text_dimensions = measure_text(&text_to_draw[..], Some(font), Comment::FONT_SIZE, 1.0);
+        // draw_rectangle(
+        //     self.pos.x,
+        //     self.pos.y - (Comment::FONT_SIZE as f32),
+        //     text_dimensions.width + (Comment::FONT_SIZE) as f32,
+        //     Comment::FONT_SIZE as f32 * 1.2,
+        //     color_u8!(0, 0, 0, 10),
+        // );
+        //
+        // draw_text_ex(
+        //     &text_to_draw[..],
+        //     self.pos.x,
+        //     self.pos.y,
+        //     TextParams {
+        //         font: Some(font),
+        //         font_size: Comment::FONT_SIZE,
+        //         font_scale: 1.0,
+        //         font_scale_aspect: 1.0,
+        //         rotation: 0.0,
+        //         color: color_u8!(0, 0, 0, 255),
+        //     },
+        // );
     }
 }
 #[derive(Debug)]
@@ -606,7 +1128,7 @@ struct Canvas {
 }
 impl Canvas {
     const GRID_SPACING: f32 = 50.0;
-    const LINE_COLOR: Color = color_u8!(0, 0, 0, 200);
+    const LINE_COLOR: Color = color_u8!(0, 0, 0, 100);
     fn new() -> Canvas {
         Canvas {
             target: Vec2 { x: 0.0, y: 0.0 },
