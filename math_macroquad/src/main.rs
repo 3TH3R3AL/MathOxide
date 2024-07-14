@@ -35,7 +35,7 @@ const CONFIG: Config = Config {
     division_padding: (5.0, 5.0),
     equation_font_size: 60,
 };
-
+const CURSOR_SYMBOL: char = '\u{FF5C}';
 fn max_f32(a: f32, b: f32) -> f32 {
     if a.is_nan() {
         b
@@ -460,12 +460,18 @@ impl EquationTree {
                 info!("drawing at {}", bottom_left_pos)
             }
 
-            Cursor => draw_text_ex(
-                " | ",
-                top_left_pos.x,
-                top_left_pos.y + text_height,
-                text_params,
-            ),
+            Cursor => {
+                let time = instant::now();
+                let cursor_visible = (time as u128 / CONFIG.cursor_blink_rate) % 2 == 0;
+                if cursor_visible {
+                    draw_text_ex(
+                        "|",
+                        top_left_pos.x,
+                        top_left_pos.y + text_height,
+                        text_params,
+                    )
+                }
+            }
             Numeral(num, exp) => draw_text_ex(
                 &(num as f64 / (u128::pow(10, exp.unwrap_or(0)) as f64)).to_string()[..],
                 top_left_pos.x,
@@ -813,7 +819,7 @@ impl FromStr for EquationTree {
 
                         '(' => Term::Parentheses(root.push_term(Term::Empty, cursor)),
                         '-' => Term::Negative(root.push_term(Term::Empty, cursor)),
-                        '\u{FF5C}' => Term::Cursor,
+                        CURSOR_SYMBOL => Term::Cursor,
                         _ => {
                             return Err(ParseTermError);
                         }
@@ -821,7 +827,7 @@ impl FromStr for EquationTree {
                     ..current_term
                 };
                 (empty_term, adding_term) = match char {
-                    '\u{FF5C}' | '0'..='9' | 'a'..='z' | 'A'..='Z' => (None, Some(cursor)),
+                    CURSOR_SYMBOL | '0'..='9' | 'a'..='z' | 'A'..='Z' => (None, Some(cursor)),
                     '(' | '-' => {
                         if let Term::Parentheses(empty) = new_node.term {
                             (Some(empty), None)
@@ -861,6 +867,10 @@ impl FromStr for EquationTree {
                             root.append_mult(current_term, Term::Variable(char.to_string()));
                         adding_term = Some(new_var_term);
                     }
+                    (_, CURSOR_SYMBOL) => {
+                        let new_var_term = root.append_mult(current_term, Term::Cursor);
+                        adding_term = Some(new_var_term);
+                    }
                     (Term::Variable(var_name), '_' | 'a'..='z' | 'A'..='Z') => {
                         if var_name.chars().count() > 1 || char == '_' {
                             root.set_term(cursor, Term::Variable(format!("{}{}", var_name, char)));
@@ -894,7 +904,13 @@ impl FromStr for EquationTree {
                         adding_term = Some(new_num_term);
                     }
 
-                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '^') => {
+                    (
+                        Term::Numeral(..)
+                        | Term::Variable(..)
+                        | Term::Parentheses(..)
+                        | Term::Cursor,
+                        '^',
+                    ) => {
                         // info!("expo attempted")
                         let new_empty = root.push_term(Term::Empty, cursor);
                         let new_term = Term::Exponentiation(
@@ -905,7 +921,13 @@ impl FromStr for EquationTree {
                         empty_term = Some(new_empty);
                         adding_term = None;
                     }
-                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), ')') => {
+                    (
+                        Term::Numeral(..)
+                        | Term::Variable(..)
+                        | Term::Parentheses(..)
+                        | Term::Cursor,
+                        ')',
+                    ) => {
                         let mut current = current_term;
                         loop {
                             if let Some(parent) = current.parent {
@@ -920,7 +942,13 @@ impl FromStr for EquationTree {
                         empty_term = None;
                         adding_term = Some(current.idx);
                     }
-                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '/') => {
+                    (
+                        Term::Numeral(..)
+                        | Term::Variable(..)
+                        | Term::Parentheses(..)
+                        | Term::Cursor,
+                        '/',
+                    ) => {
                         let denominator_location = root.push_term(Term::Empty, cursor);
                         let mut numerator = current_term;
 
@@ -944,7 +972,13 @@ impl FromStr for EquationTree {
                         empty_term = Some(denominator_location);
                         adding_term = None;
                     }
-                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '+') => {
+                    (
+                        Term::Numeral(..)
+                        | Term::Variable(..)
+                        | Term::Parentheses(..)
+                        | Term::Cursor,
+                        '+',
+                    ) => {
                         let mut current_term = current_term;
                         loop {
                             let mut parent = root.get(current_term.parent.unwrap_or(0)); // Might be a bug idk
@@ -981,7 +1015,13 @@ impl FromStr for EquationTree {
                         adding_term = None;
                     }
 
-                    (Term::Numeral(..) | Term::Variable(..) | Term::Parentheses(..), '-') => {
+                    (
+                        Term::Numeral(..)
+                        | Term::Variable(..)
+                        | Term::Parentheses(..)
+                        | Term::Cursor,
+                        '-',
+                    ) => {
                         let mut parent = root.get(current_term.parent.unwrap_or(0)); // Might be a bug idk
                         match parent.term {
                             Term::Addition(ref mut children) => {
@@ -1020,7 +1060,7 @@ impl FromStr for EquationTree {
 
                     // '(' => Term::Parentheses(Box::from(Term::Empty)),
                     // '-' => Term::Negative(Box::from(Term::Empty)),
-                    // '\u{FF5C}' => Term::Cursor,
+                    // CURSOR_SYMBOL => Term::Cursor,
                     _ => {
                         return Err(ParseTermError);
                     }
@@ -1149,7 +1189,8 @@ impl CanvasObject for Equation {
         let font = &mut fonts.equations;
         let mut text_to_draw = self.text.clone();
 
-        let equation_tree = EquationTree::from_str(&self.text[..]);
+        text_to_draw.insert(cursor, CURSOR_SYMBOL);
+        let equation_tree = EquationTree::from_str(&text_to_draw[..]);
         match equation_tree {
             Ok(mut tree) => {
                 info!("{}", tree);
@@ -1161,7 +1202,7 @@ impl CanvasObject for Equation {
         // let cursor_visible = (time as u128 / CONFIG.cursor_blink_rate) % 2 == 0;
         // if cursor_visible {
         //     //info!("cursor: {}-{:?}", cursor, text_to_draw);
-        //     text_to_draw.insert(cursor, '\u{FF5C}');
+        //     text_to_draw.insert(cursor, CURSOR_SYMBOL);
         // }
         //
         // let text_to_draw = Equation::replace_symbols_str(&self.text);
