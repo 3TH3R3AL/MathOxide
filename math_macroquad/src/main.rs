@@ -1,5 +1,3 @@
-#![no_std]
-use macroquad::math::Vec2;
 use macroquad::miniquad::window::{quit, show_keyboard};
 use macroquad::prelude::*;
 //use std::ops::{Add, Sub};
@@ -36,6 +34,8 @@ const CONFIG: Config = Config {
     equation_font_size: 60,
 };
 const CURSOR_SYMBOL: char = '\u{FF5C}';
+const PI_SYMBOL: char = '\u{03C0}';
+const THETA_SYMBOL: char = '\u{03B8}';
 fn max_f32(a: f32, b: f32) -> f32 {
     if a.is_nan() {
         b
@@ -123,6 +123,8 @@ trait CanvasObject {
     fn edit_draw(&self, cursor: usize, fonts: &mut Fonts) {}
 
     fn draw(&self, fonts: &mut Fonts) {}
+
+    fn handle_insertion(&mut self, fonts: &mut Fonts) {}
 }
 
 struct Comment {
@@ -400,11 +402,30 @@ impl EquationTree {
                 //let base_node_data = self.get_render_data(base);
                 child_node_data.h //+ text_height / 2.0 - base_node_data.h - 1.0
             }
+            Term::Multiplication(children) => children
+                .into_iter()
+                .fold(0.0, |old, new| max_f32(old, self.get_mid_line_idx(new))),
             _ => render_data.h / 2.0,
         }
     }
-    fn render(
+
+    fn render_and_fill(
         &mut self,
+        target: Option<usize>,
+        scale_factor: f32,
+        font: Option<&Font>,
+        top_left_pos: Vec2,
+    ) {
+        let current_node = self.get(target.unwrap_or(0));
+        if let None = current_node.render_data {
+            info!("Filling Data");
+            debug_assert!(target.unwrap_or(0) == 0);
+            self.fill_render_data(target, scale_factor, font);
+        }
+        self.render(target, scale_factor, font, top_left_pos);
+    }
+    fn render(
+        &self,
         target: Option<usize>,
         scale_factor: f32,
         font: Option<&Font>,
@@ -412,12 +433,6 @@ impl EquationTree {
     ) {
         let font_size = CONFIG.equation_font_size;
         let text_height = measure_text(" | ", font, font_size, scale_factor).height;
-        let current_node = self.get(target.unwrap_or(0));
-        if let None = current_node.render_data {
-            info!("Filling Data");
-            debug_assert!(target.unwrap_or(0) == 0);
-            self.fill_render_data(target, scale_factor, font);
-        }
         let current_node = self.get(target.unwrap_or(0));
         let current_data = current_node.render_data.unwrap();
 
@@ -662,7 +677,7 @@ impl EquationTree {
                     top_left_pos.y + num_data.h + CONFIG.division_padding.1 / 2.0,
                     top_left_pos.x + current_data.w,
                     top_left_pos.y + num_data.h + CONFIG.division_padding.1 / 2.0,
-                    scale_factor,
+                    1.0,
                     text_params.color,
                 );
                 self.render(
@@ -795,10 +810,36 @@ impl EquationTree {
         self.set_render_data(target.unwrap_or(0), new_render_data);
         debug_assert!(self.get(target.unwrap_or(0)).render_data.is_some())
     }
+
+    fn evaluate_eq(&self, target: Option<usize>) -> f32 {
+        use Term::*;
+        let current_node = self.get(target.unwrap_or(0));
+        match current_node.term {
+            Empty => 1.0,
+            Cursor => 1.0,
+            Numeral(num, exp) => (num as f32 / (u128::pow(10, exp.unwrap_or(0)) as f32)),
+            Variable(var_name) => panic!("Variable evaluation not yet implemented"),
+            Negative(child) => -self.evaluate_eq(Some(child)),
+            Parentheses(child) => self.evaluate_eq(Some(child)),
+            Addition(children) => children
+                .into_iter()
+                .fold(0.0, |old, new| old + self.evaluate_eq(Some(new))),
+            Multiplication(children) => children
+                .into_iter()
+                .fold(1.0, |old, new| old * self.evaluate_eq(Some(new))),
+            Exponentiation(base, child) => self
+                .evaluate_eq(Some(base))
+                .powf(self.evaluate_eq(Some(child))),
+            Division(numerator, denominator) => {
+                self.evaluate_eq(Some(numerator)) / self.evaluate_eq(Some(denominator))
+            }
+        }
+    }
 }
 impl FromStr for EquationTree {
     type Err = ParseTermError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use Term::*;
         let mut root = EquationTree::new();
         let mut empty_term = Some(0);
         let mut adding_term: Option<usize> = None;
@@ -807,19 +848,21 @@ impl FromStr for EquationTree {
             debug_assert!(empty_term.is_none() || adding_term.is_none());
             if let Some(cursor) = empty_term {
                 let current_term = root.get(cursor);
-                debug_assert!(if let Term::Empty = current_term.term {
+                debug_assert!(if let Empty = current_term.term {
                     true
                 } else {
                     false
                 });
                 let new_node = TermNode {
                     term: match char {
-                        '0'..='9' => Term::Numeral(char.to_digit(10).unwrap() as u128, None),
-                        'a'..='z' | 'A'..='Z' => Term::Variable(String::from(char)),
+                        '0'..='9' => Numeral(char.to_digit(10).unwrap() as u128, None),
+                        'a'..='z' | THETA_SYMBOL | PI_SYMBOL | 'A'..='Z' => {
+                            Variable(String::from(char))
+                        }
 
-                        '(' => Term::Parentheses(root.push_term(Term::Empty, cursor)),
-                        '-' => Term::Negative(root.push_term(Term::Empty, cursor)),
-                        CURSOR_SYMBOL => Term::Cursor,
+                        '(' => Parentheses(root.push_term(Empty, cursor)),
+                        '-' => Negative(root.push_term(Empty, cursor)),
+                        CURSOR_SYMBOL => Cursor,
                         _ => {
                             return Err(ParseTermError);
                         }
@@ -829,9 +872,9 @@ impl FromStr for EquationTree {
                 (empty_term, adding_term) = match char {
                     CURSOR_SYMBOL | '0'..='9' | 'a'..='z' | 'A'..='Z' => (None, Some(cursor)),
                     '(' | '-' => {
-                        if let Term::Parentheses(empty) = new_node.term {
+                        if let Parentheses(empty) = new_node.term {
                             (Some(empty), None)
-                        } else if let Term::Negative(empty) = new_node.term {
+                        } else if let Negative(empty) = new_node.term {
                             (Some(empty), None)
                         } else {
                             return Err(ParseTermError);
@@ -847,73 +890,100 @@ impl FromStr for EquationTree {
             if let Some(cursor) = adding_term {
                 let current_term = root.get(cursor);
                 match (current_term.term.clone(), char) {
-                    (Term::Numeral(current, None), '0'..='9') => root.set_term(
+                    (Numeral(current, None), '0'..='9') => root.set_term(
                         cursor,
-                        Term::Numeral(current * 10 + char.to_digit(10).unwrap() as u128, None),
+                        Numeral(current * 10 + char.to_digit(10).unwrap() as u128, None),
                     ),
 
-                    (Term::Numeral(current, None), '.') => {
-                        root.set_term(cursor, Term::Numeral(current, Some(0)))
+                    (Numeral(current, None), '.') => {
+                        root.set_term(cursor, Numeral(current, Some(0)))
                     }
-                    (Term::Numeral(current, Some(exp)), '0'..='9') => root.set_term(
+                    (Numeral(current, Some(exp)), '0'..='9') => root.set_term(
                         cursor,
-                        Term::Numeral(
+                        Numeral(
                             current * 10 + char.to_digit(10).unwrap() as u128,
                             Some(exp + 1),
                         ),
                     ),
-                    (Term::Numeral(..), 'a'..='z' | 'A'..='Z') => {
-                        let new_var_term =
-                            root.append_mult(current_term, Term::Variable(char.to_string()));
-                        adding_term = Some(new_var_term);
-                    }
-                    (_, CURSOR_SYMBOL) => {
-                        let new_var_term = root.append_mult(current_term, Term::Cursor);
-                        adding_term = Some(new_var_term);
-                    }
-                    (Term::Variable(var_name), '_' | 'a'..='z' | 'A'..='Z') => {
+                    (
+                        Variable(var_name),
+                        '_' | 'a'..='z' | 'A'..='Z' | THETA_SYMBOL | PI_SYMBOL,
+                    ) => {
                         if var_name.chars().count() > 1 || char == '_' {
-                            root.set_term(cursor, Term::Variable(format!("{}{}", var_name, char)));
+                            root.set_term(cursor, Variable(format!("{}{}", var_name, char)));
                         } else {
                             let new_var_term =
-                                root.append_mult(current_term, Term::Variable(char.to_string()));
+                                root.append_mult(current_term, Variable(char.to_string()));
                             adding_term = Some(new_var_term);
                         }
                     }
-                    (Term::Variable(var_name), '0'..='9') => {
+                    (Variable(var_name), '0'..='9') => {
                         if var_name.chars().count() > 1 {
-                            root.set_term(cursor, Term::Variable(format!("{}{}", var_name, char)));
+                            root.set_term(cursor, Variable(format!("{}{}", var_name, char)));
                         } else {
                             let new_num_term = root.append_mult(
                                 current_term,
-                                Term::Numeral(char.to_digit(10).unwrap() as u128, None),
+                                Numeral(char.to_digit(10).unwrap() as u128, None),
                             );
                             adding_term = Some(new_num_term);
                         }
                     }
-                    (Term::Parentheses(..), 'a'..='z' | 'A'..='Z') => {
-                        let new_var_term =
-                            root.append_mult(current_term, Term::Variable(char.to_string()));
+                    (_, ' ') => {
+                        let mut current_term = current_term;
+                        let mut guard = 0;
+                        loop {
+                            guard += 1;
+                            if guard > 20 {
+                                panic!("Infinite Loop");
+                            }
+                            let parent = match current_term.parent {
+                                Some(idx) => root.get(idx),
+                                None => TermNode {
+                                    idx: 0,
+                                    term: Division(0, 0),
+                                    parent: None,
+                                    render_data: None,
+                                },
+                            };
+                            match parent.term {
+                                Division(..) | Exponentiation(..) => {
+                                    adding_term = Some(parent.idx);
+                                    break;
+                                }
+                                _ => {
+                                    current_term = parent;
+                                }
+                            }
+                        }
+                    }
+                    (_, CURSOR_SYMBOL) => {
+                        let new_var_term = root.append_mult(current_term, Cursor);
                         adding_term = Some(new_var_term);
                     }
-                    (Term::Parentheses(..), '0'..='9') => {
+                    (_, '0'..='9') => {
                         let new_num_term = root.append_mult(
                             current_term,
-                            Term::Numeral(char.to_digit(10).unwrap() as u128, None),
+                            Numeral(char.to_digit(10).unwrap() as u128, None),
                         );
                         adding_term = Some(new_num_term);
                     }
-
-                    (
-                        Term::Numeral(..)
-                        | Term::Variable(..)
-                        | Term::Parentheses(..)
-                        | Term::Cursor,
-                        '^',
-                    ) => {
+                    (_, 'a'..='z' | 'A'..='Z') => {
+                        let new_var_term =
+                            root.append_mult(current_term, Variable(char.to_string()));
+                        adding_term = Some(new_var_term);
+                    }
+                    (_, '(') => {
+                        let new_empty_term = root.push_term_np(Empty);
+                        let new_var_term =
+                            root.append_mult(current_term, Parentheses(new_empty_term));
+                        root.set_parent(new_empty_term, new_var_term);
+                        adding_term = None;
+                        empty_term = Some(new_empty_term);
+                    }
+                    (Numeral(..) | Variable(..) | Parentheses(..) | Cursor, '^') => {
                         // info!("expo attempted")
-                        let new_empty = root.push_term(Term::Empty, cursor);
-                        let new_term = Term::Exponentiation(
+                        let new_empty = root.push_term(Empty, cursor);
+                        let new_term = Exponentiation(
                             root.push_term(current_term.term.clone(), cursor),
                             new_empty,
                         );
@@ -921,18 +991,17 @@ impl FromStr for EquationTree {
                         empty_term = Some(new_empty);
                         adding_term = None;
                     }
-                    (
-                        Term::Numeral(..)
-                        | Term::Variable(..)
-                        | Term::Parentheses(..)
-                        | Term::Cursor,
-                        ')',
-                    ) => {
+                    (_, ')') => {
                         let mut current = current_term;
+                        let mut guard = 0;
                         loop {
+                            guard += 1;
+                            if guard > 20 {
+                                panic!("Infinite Loop");
+                            }
                             if let Some(parent) = current.parent {
                                 current = root.get(parent);
-                                if let Term::Parentheses(..) = current.term {
+                                if let Parentheses(..) = current.term {
                                     break;
                                 }
                             } else {
@@ -942,20 +1011,19 @@ impl FromStr for EquationTree {
                         empty_term = None;
                         adding_term = Some(current.idx);
                     }
-                    (
-                        Term::Numeral(..)
-                        | Term::Variable(..)
-                        | Term::Parentheses(..)
-                        | Term::Cursor,
-                        '/',
-                    ) => {
-                        let denominator_location = root.push_term(Term::Empty, cursor);
+                    (_, '/') => {
+                        let denominator_location = root.push_term(Empty, cursor);
                         let mut numerator = current_term;
 
+                        let mut guard = 0;
                         loop {
+                            guard += 1;
+                            if guard > 20 {
+                                panic!("Infinite Loop");
+                            }
                             if let Some(parent) = numerator.parent {
                                 let next_parent = root.get(parent);
-                                if let Term::Multiplication(..) = next_parent.term {
+                                if let Multiplication(..) = next_parent.term {
                                     numerator = next_parent;
                                 } else {
                                     break;
@@ -964,7 +1032,7 @@ impl FromStr for EquationTree {
                                 break;
                             }
                         }
-                        let new_term = Term::Division(
+                        let new_term = Division(
                             root.push_term(numerator.term.clone(), cursor),
                             denominator_location,
                         );
@@ -972,41 +1040,100 @@ impl FromStr for EquationTree {
                         empty_term = Some(denominator_location);
                         adding_term = None;
                     }
-                    (
-                        Term::Numeral(..)
-                        | Term::Variable(..)
-                        | Term::Parentheses(..)
-                        | Term::Cursor,
-                        '+',
-                    ) => {
+                    (_, '+' | '-') => {
                         let mut current_term = current_term;
+                        let mut guard = 0;
                         loop {
-                            let mut parent = root.get(current_term.parent.unwrap_or(0)); // Might be a bug idk
+                            guard += 1;
+                            if guard > 20 {
+                                panic!("Infinite Loop");
+                            }
+                            let mut parent = match current_term.parent {
+                                Some(idx) => root.get(idx),
+                                None => TermNode {
+                                    idx: 0,
+                                    term: Empty,
+                                    parent: None,
+                                    render_data: None,
+                                },
+                            };
                             match parent.term {
-                                Term::Addition(ref mut children) => {
-                                    let to_append_location =
-                                        root.push_term(Term::Empty, parent.idx);
-                                    children.push(to_append_location);
-                                    root.update_node(parent);
+                                Addition(ref mut children) => {
+                                    let to_append_location = match char {
+                                        '+' => {
+                                            let to_append_location =
+                                                root.push_term(Empty, parent.idx);
+                                            children.push(to_append_location);
+                                            root.update_node(parent);
+                                            to_append_location
+                                        }
+                                        '-' => {
+                                            let new_empty_location = root.push_term_np(Empty);
+                                            let to_append_location = root.push_term(
+                                                Negative(new_empty_location),
+                                                parent.idx,
+                                            );
+
+                                            root.set_parent(new_empty_location, to_append_location);
+                                            children.push(to_append_location);
+                                            root.update_node(parent);
+                                            new_empty_location
+                                        }
+                                        _ => {
+                                            panic!("Invalid char")
+                                        }
+                                    };
                                     empty_term = Some(to_append_location);
                                     break;
                                 }
-                                Term::Multiplication(..) => {
+                                Negative(..) => {
+                                    current_term = parent;
+                                }
+                                Multiplication(..) => {
                                     current_term = parent;
                                 }
                                 _ => {
-                                    let new_mult_location = current_term.idx;
-                                    let new_o_location = root.push(current_term);
-                                    root.set_parent(new_o_location, new_mult_location);
-                                    let new_term_location =
-                                        root.push_term(Term::Empty, new_mult_location);
-                                    root.set_term(
-                                        new_mult_location,
-                                        Term::Addition(Vec::from([
-                                            new_o_location,
-                                            new_term_location,
-                                        ])),
-                                    );
+                                    let new_term_location = match char {
+                                        '+' => {
+                                            let new_mult_location = current_term.idx;
+                                            let new_o_location = root.push(current_term);
+                                            root.set_parent(new_o_location, new_mult_location);
+                                            let new_term_location =
+                                                root.push_term(Empty, new_mult_location);
+                                            root.set_term(
+                                                new_mult_location,
+                                                Addition(Vec::from([
+                                                    new_o_location,
+                                                    new_term_location,
+                                                ])),
+                                            );
+                                            new_term_location
+                                        }
+                                        '-' => {
+                                            let new_mult_location = current_term.idx;
+                                            let new_o_location = root.push(current_term);
+                                            root.set_parent(new_o_location, new_mult_location);
+
+                                            let new_empty_location = root.push_term_np(Empty);
+                                            let to_append_location = root.push_term(
+                                                Negative(new_empty_location),
+                                                new_mult_location,
+                                            );
+                                            root.set_parent(new_empty_location, to_append_location);
+
+                                            root.set_term(
+                                                new_mult_location,
+                                                Addition(Vec::from([
+                                                    new_o_location,
+                                                    to_append_location,
+                                                ])),
+                                            );
+                                            new_empty_location
+                                        }
+                                        _ => {
+                                            panic!("Invalid char")
+                                        }
+                                    };
                                     empty_term = Some(new_term_location);
                                     break;
                                 }
@@ -1015,52 +1142,6 @@ impl FromStr for EquationTree {
                         adding_term = None;
                     }
 
-                    (
-                        Term::Numeral(..)
-                        | Term::Variable(..)
-                        | Term::Parentheses(..)
-                        | Term::Cursor,
-                        '-',
-                    ) => {
-                        let mut parent = root.get(current_term.parent.unwrap_or(0)); // Might be a bug idk
-                        match parent.term {
-                            Term::Addition(ref mut children) => {
-                                let new_empty_location = root.push_term_np(Term::Empty);
-                                let to_append_location =
-                                    root.push_term(Term::Negative(new_empty_location), parent.idx);
-
-                                root.set_parent(new_empty_location, to_append_location);
-                                children.push(to_append_location);
-                                root.update_node(parent);
-                                empty_term = Some(new_empty_location);
-                            }
-                            _ => {
-                                let new_mult_location = current_term.idx;
-                                let new_o_location = root.push(current_term);
-                                root.set_parent(new_o_location, new_mult_location);
-
-                                let new_empty_location = root.push_term_np(Term::Empty);
-                                let to_append_location = root.push_term(
-                                    Term::Negative(new_empty_location),
-                                    new_mult_location,
-                                );
-                                root.set_parent(new_empty_location, to_append_location);
-
-                                root.set_term(
-                                    new_mult_location,
-                                    Term::Addition(Vec::from([new_o_location, to_append_location])),
-                                );
-                                empty_term = Some(new_empty_location);
-                            }
-                        }
-                        adding_term = None;
-                    }
-
-                    // ( => {terms.append(other);},
-
-                    // '(' => Term::Parentheses(Box::from(Term::Empty)),
-                    // '-' => Term::Negative(Box::from(Term::Empty)),
-                    // CURSOR_SYMBOL => Term::Cursor,
                     _ => {
                         return Err(ParseTermError);
                     }
@@ -1119,13 +1200,19 @@ impl TermNode {
 
 impl Display for EquationTree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "EquationTree:\n{}", self.get(0).to_string(self))
+        write!(
+            f,
+            "EquationTree:\n{} = {},",
+            self.get(0).to_string(self),
+            self.evaluate_eq(None)
+        )
     }
 }
 /// A Mathematical Equation on the Canvas
 struct Equation {
     text: String,
     pos: Vec2,
+    equation_tree: Option<EquationTree>,
 }
 
 impl Equation {
@@ -1149,85 +1236,83 @@ impl CanvasObject for Equation {
             *cursor += 1;
             // info!("{}", self.text);
         }
+        // self.text = self.replace_symbols();
     }
     fn backspace(&mut self, cursor: usize) {
         self.text.remove(cursor - 1);
+        // let mut chars: Vec<char> = self.text.chars().collect();
+        // if cursor < chars.len() {
+        //     chars.remove(cursor);
+        // }
+        // self.text = chars.into_iter().collect();
+    }
+    fn handle_insertion(&mut self, fonts: &mut Fonts) {
+        let font = &mut fonts.equations;
+        // NOTE: This may lead to a strange edge case where the tree is inserted without being
+        // rendered, leading to a panic. Will fix if it is a problem
+        let equation_tree = EquationTree::from_str(&self.text[..]);
+        self.equation_tree = match equation_tree {
+            Ok(mut tree) => {
+                let current_node = tree.get(0);
+                if let None = current_node.render_data {
+                    tree.fill_render_data(None, 1.0, Some(font));
+                }
+                Some(tree)
+            }
+            Err(_) => None,
+        }
     }
     fn draw(&self, fonts: &mut Fonts) {
         let font = &mut fonts.equations;
 
-        let text_to_draw = self.replace_symbols();
-        let text_dimensions = measure_text(
-            &text_to_draw[..],
-            Some(font),
-            CONFIG.equation_font_size,
-            1.0,
-        );
+        match self.equation_tree {
+            Some(ref tree) => {
+                tree.render(None, 1.0, Some(font), self.pos);
+            }
+            None => {
+                let text_to_draw = self.replace_symbols();
+                let text_dimensions = measure_text(
+                    &text_to_draw[..],
+                    Some(font),
+                    CONFIG.equation_font_size,
+                    1.0,
+                );
 
-        draw_rectangle(
-            self.pos.x,
-            self.pos.y - (Comment::FONT_SIZE as f32),
-            text_dimensions.width,
-            Comment::FONT_SIZE as f32 * 1.2,
-            color_u8!(0, 0, 0, 10),
-        );
+                draw_rectangle(
+                    self.pos.x,
+                    self.pos.y - (Comment::FONT_SIZE as f32),
+                    text_dimensions.width,
+                    Comment::FONT_SIZE as f32 * 1.2,
+                    color_u8!(0, 0, 0, 10),
+                );
 
-        draw_text_ex(
-            &text_to_draw[..],
-            self.pos.x,
-            self.pos.y,
-            TextParams {
-                font: Some(font),
-                font_size: Comment::FONT_SIZE,
-                color: color_u8!(0, 0, 0, 255),
-                ..Default::default()
-            },
-        );
+                draw_text_ex(
+                    &text_to_draw[..],
+                    self.pos.x,
+                    self.pos.y,
+                    TextParams {
+                        font: Some(font),
+                        font_size: Comment::FONT_SIZE,
+                        color: color_u8!(0, 0, 0, 255),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
     }
 
     fn edit_draw(&self, cursor: usize, fonts: &mut Fonts) {
         let font = &mut fonts.equations;
         let mut text_to_draw = self.text.clone();
-
         text_to_draw.insert(cursor, CURSOR_SYMBOL);
         let equation_tree = EquationTree::from_str(&text_to_draw[..]);
         match equation_tree {
             Ok(mut tree) => {
                 info!("{}", tree);
-                tree.render(None, 1.0, Some(font), self.pos);
+                tree.render_and_fill(None, 1.0, Some(font), self.pos);
             }
             Err(_) => info!("Parsing Error :("),
         }
-        // let time = instant::now();
-        // let cursor_visible = (time as u128 / CONFIG.cursor_blink_rate) % 2 == 0;
-        // if cursor_visible {
-        //     //info!("cursor: {}-{:?}", cursor, text_to_draw);
-        //     text_to_draw.insert(cursor, CURSOR_SYMBOL);
-        // }
-        //
-        // let text_to_draw = Equation::replace_symbols_str(&self.text);
-        // let text_dimensions = measure_text(&text_to_draw[..], Some(font), Comment::FONT_SIZE, 1.0);
-        // draw_rectangle(
-        //     self.pos.x,
-        //     self.pos.y - (Comment::FONT_SIZE as f32),
-        //     text_dimensions.width + (Comment::FONT_SIZE) as f32,
-        //     Comment::FONT_SIZE as f32 * 1.2,
-        //     color_u8!(0, 0, 0, 10),
-        // );
-        //
-        // draw_text_ex(
-        //     &text_to_draw[..],
-        //     self.pos.x,
-        //     self.pos.y,
-        //     TextParams {
-        //         font: Some(font),
-        //         font_size: Comment::FONT_SIZE,
-        //         font_scale: 1.0,
-        //         font_scale_aspect: 1.0,
-        //         rotation: 0.0,
-        //         color: color_u8!(0, 0, 0, 255),
-        //     },
-        // );
     }
 }
 #[derive(Debug)]
@@ -1277,12 +1362,14 @@ impl Canvas {
         }
     }
 
-    fn insert_object_if_editing(&mut self) {
+    fn insert_object_if_editing(&mut self, fonts: &mut Fonts) {
         let temp_state = core::mem::replace(&mut self.state, CanvasState::Default);
         match temp_state {
             CanvasState::Editing { editing_object, .. } => {
                 if !editing_object.is_empty() {
                     self.objects.push(editing_object);
+                    let idx = self.objects.len() - 1;
+                    self.objects[idx].handle_insertion(fonts);
                 }
             }
             _ => {}
@@ -1476,7 +1563,7 @@ impl State {
         match self.tool {
             Tool::Comment | Tool::Equation => {
                 if is_mouse_button_pressed(MouseButton::Left) {
-                    self.canvas.insert_object_if_editing();
+                    self.canvas.insert_object_if_editing(&mut self.fonts);
                     self.canvas.start_drag();
                 }
 
@@ -1514,6 +1601,7 @@ impl State {
                                         pos: Vec2::from(mouse_position())
                                             + self.canvas.camera.target.clone()
                                             - Vec2::new(screen_width() / 2., screen_height() / 2.),
+                                        equation_tree: None,
                                     }));
                                 }
                             },
