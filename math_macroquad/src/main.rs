@@ -1,3 +1,15 @@
+/*
+*  TODO:
+*  - DragnDrop
+*  - Select
+*  - Copy Paste
+*  - Symbols n var evaluation
+*  - Functions
+*  - Equals
+*
+*
+*
+*/
 use macroquad::miniquad::window::{quit, show_keyboard};
 use macroquad::prelude::*;
 //use std::ops::{Add, Sub};
@@ -9,6 +21,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt::{self, Display};
 use core::str::FromStr;
+use simplelog::Config;
 extern crate simplelog;
 #[global_allocator]
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
@@ -19,6 +32,7 @@ struct Config {
     backspace_interval_ramp: f32,
     click_distance: f32,
     exponentiation_scale_factor: f32,
+    subscript_scale_factor: f32,
     division_scale_factor: f32,
     division_padding: (f32, f32),
     equation_font_size: u16,
@@ -29,6 +43,7 @@ const CONFIG: Config = Config {
     backspace_interval_ramp: 0.9,
     click_distance: 2.0,
     exponentiation_scale_factor: 0.8,
+    subscript_scale_factor: 0.6,
     division_scale_factor: 0.95,
     division_padding: (5.0, 5.0),
     equation_font_size: 60,
@@ -264,10 +279,10 @@ impl Term {
         }
     }
 }
-struct EquationTree {
+struct TermTree {
     arena: Vec<TermNode>,
 }
-impl EquationTree {
+impl TermTree {
     fn new() -> Self {
         let init = Vec::from([TermNode {
             idx: 0,
@@ -304,7 +319,8 @@ impl EquationTree {
 
     fn get_render_data(&self, idx: usize) -> TNRenderData {
         let node = self.get(idx);
-        node.render_data.unwrap()
+        node.render_data
+            .expect("Data should be filled before gotten")
     }
     fn push(&mut self, mut node: TermNode) -> usize {
         node.idx = self.arena.len();
@@ -394,13 +410,23 @@ impl EquationTree {
         self.get_mid_line(self.get(idx))
     }
     fn get_mid_line(&self, target: TermNode) -> f32 {
-        let render_data = target.render_data.unwrap();
+        let render_data = target
+            .render_data
+            .expect("Render data should be filled before midline is called");
         match target.term {
             Term::Division(_num, denom) => render_data.h - self.get_render_data(denom).h,
             Term::Exponentiation(_base, exp) => {
                 let child_node_data = self.get_render_data(exp);
                 //let base_node_data = self.get_render_data(base);
                 child_node_data.h //+ text_height / 2.0 - base_node_data.h - 1.0
+            }
+            Term::Variable(var_name) => {
+                let h = render_data.h;
+                if var_name.chars().count() > 2 {
+                    h / (1.0 + CONFIG.subscript_scale_factor / 2.0) / 2.0
+                } else {
+                    h / 2.0
+                }
             }
             Term::Multiplication(children) => children
                 .into_iter()
@@ -418,7 +444,7 @@ impl EquationTree {
     ) {
         let current_node = self.get(target.unwrap_or(0));
         if let None = current_node.render_data {
-            info!("Filling Data");
+            // info!("Filling Data");
             debug_assert!(target.unwrap_or(0) == 0);
             self.fill_render_data(target, scale_factor, font);
         }
@@ -494,12 +520,31 @@ impl EquationTree {
                 text_params,
             ),
 
-            Variable(var_name) => draw_text_ex(
-                &var_name,
-                top_left_pos.x,
-                top_left_pos.y + text_height,
-                text_params,
-            ),
+            Variable(mut var_name) => {
+                draw_text_ex(
+                    &var_name[0..1],
+                    top_left_pos.x,
+                    top_left_pos.y + text_height,
+                    text_params.clone(),
+                );
+                if var_name.chars().count() > 2 {
+                    let time = instant::now();
+                    let cursor_visible = (time as u128 / CONFIG.cursor_blink_rate) % 2 == 0;
+                    if cursor_visible {
+                        var_name = var_name.replace("|", " ");
+                    }
+                    draw_text_ex(
+                        &var_name[2..],
+                        top_left_pos.x
+                            + measure_text(&var_name[0..1], font, font_size, scale_factor).width,
+                        top_left_pos.y + text_height * (1.0 + CONFIG.subscript_scale_factor / 2.0),
+                        TextParams {
+                            font_scale: scale_factor * CONFIG.subscript_scale_factor,
+                            ..text_params
+                        },
+                    );
+                }
+            }
             Negative(child) => {
                 draw_text_ex("-", bottom_left_pos.x, bottom_left_pos.y, text_params);
                 let negative_size = measure_text("-", font, font_size, scale_factor);
@@ -711,10 +756,23 @@ impl EquationTree {
                 ),
                 text_height,
             )),
-            Variable(var_name) => TNRenderData::from((
-                measure_text(&var_name[..], font, font_size, scale_factor),
-                text_height,
-            )),
+            Variable(var_name) => {
+                let mut base = TNRenderData::from((
+                    measure_text(&var_name[0..1], font, font_size, scale_factor),
+                    text_height,
+                ));
+                if var_name.chars().count() > 2 {
+                    base.h += text_height * CONFIG.subscript_scale_factor / 2.0;
+                    base.w += measure_text(
+                        &var_name[2..],
+                        font,
+                        font_size,
+                        scale_factor * CONFIG.subscript_scale_factor,
+                    )
+                    .width;
+                }
+                base
+            }
             Negative(child) => {
                 let negative_size = measure_text("-", font, font_size, scale_factor);
                 self.fill_render_data(Some(child), scale_factor, font);
@@ -818,7 +876,7 @@ impl EquationTree {
             Empty => 1.0,
             Cursor => 1.0,
             Numeral(num, exp) => (num as f32 / (u128::pow(10, exp.unwrap_or(0)) as f32)),
-            Variable(var_name) => panic!("Variable evaluation not yet implemented"),
+            Variable(var_name) => 1.0,
             Negative(child) => -self.evaluate_eq(Some(child)),
             Parentheses(child) => self.evaluate_eq(Some(child)),
             Addition(children) => children
@@ -836,14 +894,15 @@ impl EquationTree {
         }
     }
 }
-impl FromStr for EquationTree {
+impl FromStr for TermTree {
     type Err = ParseTermError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         use Term::*;
-        let mut root = EquationTree::new();
+        let mut root = TermTree::new();
         let mut empty_term = Some(0);
         let mut adding_term: Option<usize> = None;
         let mut chars = s.chars();
+
         for char in chars {
             debug_assert!(empty_term.is_none() || adding_term.is_none());
             if let Some(cursor) = empty_term {
@@ -917,18 +976,19 @@ impl FromStr for EquationTree {
                             adding_term = Some(new_var_term);
                         }
                     }
-                    (Variable(var_name), '0'..='9') => {
-                        if var_name.chars().count() > 1 {
-                            root.set_term(cursor, Variable(format!("{}{}", var_name, char)));
-                        } else {
-                            let new_num_term = root.append_mult(
-                                current_term,
-                                Numeral(char.to_digit(10).unwrap() as u128, None),
-                            );
-                            adding_term = Some(new_num_term);
-                        }
+                    (Variable(var_name), CURSOR_SYMBOL) if var_name.len() > 1 => {
+                        root.set_term(cursor, Variable(format!("{}{}", var_name, "|")));
+                    }
+                    (Variable(var_name), '0'..='9') if var_name.len() > 1 => {
+                        let new_num_term = root.append_mult(
+                            current_term,
+                            Numeral(char.to_digit(10).unwrap() as u128, None),
+                        );
+                        adding_term = Some(new_num_term);
                     }
                     (_, ' ') => {
+                        // NOTE: This does not work to escape extended variable names
+                        // when in root. May fix later, but not a large problem
                         let mut current_term = current_term;
                         let mut guard = 0;
                         loop {
@@ -1153,7 +1213,7 @@ impl FromStr for EquationTree {
 }
 
 impl TermNode {
-    fn to_string(&self, tree: &EquationTree) -> String {
+    fn to_string(&self, tree: &TermTree) -> String {
         use Term::*;
         match &self.term {
             Empty => "(Empty)".to_string(),
@@ -1198,11 +1258,11 @@ impl TermNode {
     }
 }
 
-impl Display for EquationTree {
+impl Display for TermTree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "EquationTree:\n{} = {},",
+            "TermTree:\n{} = {},",
             self.get(0).to_string(self),
             self.evaluate_eq(None)
         )
@@ -1212,18 +1272,26 @@ impl Display for EquationTree {
 struct Equation {
     text: String,
     pos: Vec2,
-    equation_tree: Option<EquationTree>,
+    equation: Vec<TermTree>,
 }
 
 impl Equation {
     fn replace_symbols(&self) -> String {
         Equation::replace_symbols_str(&self.text)
     }
-
     fn replace_symbols_str(text: &String) -> String {
         text.replace("pi", "\u{03C0}")
             .replace("theta", "\u{03B8}")
             .replace("*", "\u{00B7}")
+    }
+    fn parse_text(&self) -> Result<Vec<TermTree>, ParseTermError> {
+        let split = self.text.split("=");
+        let mut ret = Vec::new();
+        for str in split {
+            let term = TermTree::from_str(str)?;
+            ret.push(term);
+        }
+        Ok(ret)
     }
 }
 impl CanvasObject for Equation {
@@ -1248,64 +1316,66 @@ impl CanvasObject for Equation {
     }
     fn handle_insertion(&mut self, fonts: &mut Fonts) {
         let font = &mut fonts.equations;
-        // NOTE: This may lead to a strange edge case where the tree is inserted without being
-        // rendered, leading to a panic. Will fix if it is a problem
-        let equation_tree = EquationTree::from_str(&self.text[..]);
-        self.equation_tree = match equation_tree {
-            Ok(mut tree) => {
-                let current_node = tree.get(0);
-                if let None = current_node.render_data {
-                    tree.fill_render_data(None, 1.0, Some(font));
+        let equation = self.parse_text();
+        self.equation = match equation {
+            Ok(mut equation) => {
+                let mut eq_to_set = Vec::new();
+                for mut term in equation {
+                    let current_node = term.get(0);
+                    if let None = current_node.render_data {
+                        term.fill_render_data(None, 1.0, Some(font));
+                    }
+                    eq_to_set.push(term);
                 }
-                Some(tree)
+                eq_to_set
             }
-            Err(_) => None,
+            Err(_) => Vec::new(),
         }
     }
     fn draw(&self, fonts: &mut Fonts) {
         let font = &mut fonts.equations;
-
-        match self.equation_tree {
-            Some(ref tree) => {
-                tree.render(None, 1.0, Some(font), self.pos);
-            }
-            None => {
-                let text_to_draw = self.replace_symbols();
-                let text_dimensions = measure_text(
-                    &text_to_draw[..],
-                    Some(font),
-                    CONFIG.equation_font_size,
-                    1.0,
-                );
-
-                draw_rectangle(
-                    self.pos.x,
-                    self.pos.y - (Comment::FONT_SIZE as f32),
-                    text_dimensions.width,
-                    Comment::FONT_SIZE as f32 * 1.2,
-                    color_u8!(0, 0, 0, 10),
-                );
-
-                draw_text_ex(
-                    &text_to_draw[..],
-                    self.pos.x,
-                    self.pos.y,
-                    TextParams {
-                        font: Some(font),
-                        font_size: Comment::FONT_SIZE,
-                        color: color_u8!(0, 0, 0, 255),
-                        ..Default::default()
-                    },
-                );
-            }
+        let mut combined_w = 0.0;
+        let midline = self
+            .equation
+            .iter()
+            .fold(0.0, |old, new| max_f32(old, new.get_mid_line_idx(0)));
+        let term_tree = match self.equation.get(0) {
+            Some(t) => t,
+            None => return,
+        };
+        let c_midline = term_tree.get_mid_line_idx(0);
+        term_tree.render(
+            None,
+            1.0,
+            Some(font),
+            Vec2::new(self.pos.x + combined_w, self.pos.y + midline - c_midline),
+        );
+        combined_w += term_tree.get_render_data(0).w;
+        for term_tree in &self.equation[1..] {
+            let eq_sign_size = measure_text(" = ", Some(&font), CONFIG.equation_font_size, 1.0);
+            draw_text(
+                " = ",
+                self.pos.x + combined_w,
+                self.pos.y + midline - eq_sign_size.height / 2.0,
+                CONFIG.equation_font_size as f32,
+                color_u8!(0, 0, 0, 255),
+            );
+            combined_w += eq_sign_size.width;
+            let c_midline = term_tree.get_mid_line_idx(0);
+            term_tree.render(
+                None,
+                1.0,
+                Some(font),
+                Vec2::new(self.pos.x + combined_w, self.pos.y + midline - c_midline),
+            );
+            combined_w += term_tree.get_render_data(0).w;
         }
     }
-
     fn edit_draw(&self, cursor: usize, fonts: &mut Fonts) {
         let font = &mut fonts.equations;
         let mut text_to_draw = self.text.clone();
         text_to_draw.insert(cursor, CURSOR_SYMBOL);
-        let equation_tree = EquationTree::from_str(&text_to_draw[..]);
+        let equation_tree = TermTree::from_str(&text_to_draw[..]);
         match equation_tree {
             Ok(mut tree) => {
                 info!("{}", tree);
