@@ -21,7 +21,6 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt::{self, Display};
 use core::str::FromStr;
-use simplelog::Config;
 extern crate simplelog;
 #[global_allocator]
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
@@ -51,6 +50,7 @@ const CONFIG: Config = Config {
 const CURSOR_SYMBOL: char = '\u{FF5C}';
 const PI_SYMBOL: char = '\u{03C0}';
 const THETA_SYMBOL: char = '\u{03B8}';
+const EQUATION_KEYWORDS: &[&str] = &["int", "pi", "theta", "sum", "e"];
 fn max_f32(a: f32, b: f32) -> f32 {
     if a.is_nan() {
         b
@@ -134,7 +134,7 @@ trait CanvasObject {
         true
     }
     fn edit_text(&mut self, cursor: &mut usize, text_input: char) {}
-    fn backspace(&mut self, cursor: usize) {}
+    fn backspace(&mut self, cursor: &mut usize) {}
     fn edit_draw(&self, cursor: usize, fonts: &mut Fonts) {}
 
     fn draw(&self, fonts: &mut Fonts) {}
@@ -160,8 +160,9 @@ impl CanvasObject for Comment {
             //info!("{}", self.text);
         }
     }
-    fn backspace(&mut self, cursor: usize) {
-        self.text.remove(cursor - 1);
+    fn backspace(&mut self, cursor: &mut usize) {
+        self.text.remove(*cursor - 1);
+        *cursor -= 1;
     }
     fn draw(&self, fonts: &mut Fonts) {
         let font = &mut fonts.comments;
@@ -1306,8 +1307,12 @@ impl CanvasObject for Equation {
         }
         // self.text = self.replace_symbols();
     }
-    fn backspace(&mut self, cursor: usize) {
-        self.text.remove(cursor - 1);
+    fn backspace(&mut self, cursor: &mut usize) {
+        let keyword = EQUATION_KEYWORDS
+            .iter()
+            .find(|&&x| x == &self.text[*cursor - x.len()..*cursor]);
+
+        self.text.remove(*cursor - 1);
         // let mut chars: Vec<char> = self.text.chars().collect();
         // if cursor < chars.len() {
         //     chars.remove(cursor);
@@ -1507,8 +1512,7 @@ impl Canvas {
                 if *cursor == 0 as usize {
                     return;
                 }
-                editing_object.backspace(*cursor);
-                *cursor -= 1;
+                editing_object.backspace(cursor);
             }
             _ => {}
         }
